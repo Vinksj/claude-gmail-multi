@@ -24,6 +24,14 @@ const fail = (e: unknown): ToolResult => ({
   content: [{ type: 'text', text: e instanceof Error ? e.message : String(e) }],
 });
 
+function safeDownloadFilename(input: string): string {
+  const basename = path.basename(input);
+  const cleaned = basename.replace(/[^A-Za-z0-9._()\- ]/g, '_').replace(/^\.+/, '').trim();
+  const compact = cleaned.replace(/\s+/g, ' ').replace(/^-+/, '');
+  const noTrailingDots = compact.replace(/[. ]+$/g, '');
+  return (noTrailingDots || 'attachment').slice(0, 180);
+}
+
 function register(
   server: McpServer,
   name: string,
@@ -291,7 +299,7 @@ export function registerTools(server: McpServer): void {
         })
       );
       if (!res.data.data) throw new Error('Attachment has no data.');
-      const safe = (args.filename ?? `attachment-${args.attachmentId.slice(0, 12)}`).replace(/[/\\]/g, '_');
+      const safe = safeDownloadFilename(args.filename ?? `attachment-${args.attachmentId.slice(0, 12)}`);
       let target = path.join(os.homedir(), 'Downloads', safe);
       const { name, ext } = path.parse(target);
       for (let i = 1; fs.existsSync(target); i++) target = path.join(os.homedir(), 'Downloads', `${name}-${i}${ext}`);

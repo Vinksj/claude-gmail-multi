@@ -1,6 +1,8 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
+import type { CodeChallengeMethod } from 'google-auth-library';
 import { google } from 'googleapis';
 import { loadClientCredentials, loadConfig, saveConfig, writeToken, dropClient } from './accounts.js';
 
@@ -37,11 +39,16 @@ export async function authorizeAccount(
     clientSecret: creds.client_secret,
     redirectUri,
   });
+  const oauthState = randomUUID();
+  const { codeVerifier, codeChallenge } = await client.generateCodeVerifierAsync();
   const authUrl = client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent', // force a refresh token even on re-auth
     scope: [GMAIL_SCOPE],
     login_hint: expectedEmail,
+    state: oauthState,
+    code_challenge_method: 'S256' as CodeChallengeMethod,
+    code_challenge: codeChallenge,
   });
 
   const codePromise = new Promise<string>((resolve, reject) => {
@@ -56,14 +63,21 @@ export async function authorizeAccount(
       }
       const error = url.searchParams.get('error');
       const code = url.searchParams.get('code');
+      const state = url.searchParams.get('state');
       res.writeHead(200, { 'Content-Type': 'text/html' });
+      const stateOk = state === oauthState;
       res.end(
         '<html><body style="font-family:sans-serif;margin:40px"><h2>gmail-mcp</h2><p>' +
-          (code ? 'Authorized. You can close this tab.' : `Authorization failed: ${error ?? 'unknown error'}`) +
+          (code && stateOk
+            ? 'Authorized. You can close this tab.'
+            : `Authorization failed: ${
+                !stateOk ? 'invalid OAuth state; re-run auth from your terminal' : error ?? 'unknown error'
+              }`) +
           '</p></body></html>'
       );
       clearTimeout(timer);
-      if (code) resolve(code);
+      if (!stateOk) reject(new Error('OAuth callback state mismatch. Re-run the auth command and try again.'));
+      else if (code) resolve(code);
       else reject(new Error(`Authorization failed: ${error ?? 'no code returned'}`));
     });
   });
@@ -77,7 +91,7 @@ export async function authorizeAccount(
 
   try {
     const code = await codePromise;
-    const { tokens } = await client.getToken(code);
+    const { tokens } = await client.getToken({ code, codeVerifier });
     if (!tokens.refresh_token) {
       throw new Error(
         'Google did not return a refresh token. Re-run the auth; if it persists, remove this app at ' +
