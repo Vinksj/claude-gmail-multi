@@ -2,6 +2,8 @@ import type { gmail_v1 } from 'googleapis';
 
 export const MAX_BODY_CHARS = 4000;
 export const MAX_THREAD_CHARS = 25000;
+/** HTML bodies are verbose; cap them well below the plain-text allowance. */
+export const MAX_HTML_CHARS = 20000;
 
 export interface AttachmentShape {
   filename: string;
@@ -20,6 +22,8 @@ export interface MessageShape {
   subject: string;
   labels: string[];
   body: string;
+  /** Raw text/html part. Only populated when the caller opts in — see get_message's includeHtml. */
+  htmlBody?: string;
   attachments: AttachmentShape[];
 }
 
@@ -33,6 +37,7 @@ function decodeB64(data?: string | null): string {
 
 export function extractBody(payload?: gmail_v1.Schema$MessagePart | null): {
   text: string;
+  html: string;
   attachments: AttachmentShape[];
 } {
   const plains: string[] = [];
@@ -55,8 +60,9 @@ export function extractBody(payload?: gmail_v1.Schema$MessagePart | null): {
     part.parts?.forEach(walk);
   };
   walk(payload);
-  const text = plains.length > 0 ? plains.join('\n') : stripHtml(htmls.join('\n'));
-  return { text: text.trim(), attachments };
+  const html = htmls.join('\n');
+  const text = plains.length > 0 ? plains.join('\n') : stripHtml(html);
+  return { text: text.trim(), html: html.trim(), attachments };
 }
 
 export function stripHtml(html: string): string {
@@ -89,9 +95,13 @@ export function truncate(text: string, max: number, hint = 'use get_message for 
   return `${head}\n[... truncated, ${text.length.toLocaleString('en-US')} chars total — ${hint}]`;
 }
 
-export function shapeMessage(msg: gmail_v1.Schema$Message, maxBody = MAX_BODY_CHARS): MessageShape {
+export function shapeMessage(
+  msg: gmail_v1.Schema$Message,
+  maxBody = MAX_BODY_CHARS,
+  includeHtml = false
+): MessageShape {
   const payload = msg.payload;
-  const { text, attachments } = extractBody(payload);
+  const { text, html, attachments } = extractBody(payload);
   const cc = header(payload, 'Cc');
   return {
     id: msg.id ?? '',
@@ -103,6 +113,9 @@ export function shapeMessage(msg: gmail_v1.Schema$Message, maxBody = MAX_BODY_CH
     subject: header(payload, 'Subject'),
     labels: msg.labelIds ?? [],
     body: truncate(text, maxBody),
+    ...(includeHtml && html
+      ? { htmlBody: truncate(html, MAX_HTML_CHARS, 'HTML body truncated') }
+      : {}),
     attachments,
   };
 }

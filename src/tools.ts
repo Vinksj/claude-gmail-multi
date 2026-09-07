@@ -59,20 +59,125 @@ interface ComposeArgs {
   bcc?: string[];
   subject?: string;
   body: string;
+  htmlBody?: string;
+  attachments?: AttachmentArg[];
   replyToMessageId?: string;
 }
+
+interface AttachmentArg {
+  filename?: string;
+  path?: string;
+  content?: string;
+  contentType?: string;
+  cid?: string;
+}
+
+/** Gmail rejects messages whose total size exceeds 25MB. */
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+const attachmentShape = z.object({
+  filename: z
+    .string()
+    .optional()
+    .describe('Filename the recipient sees, e.g. "Quote QU0385.pdf". Defaults to the basename of "path" when omitted.'),
+  path: z
+    .string()
+    .optional()
+    .describe(
+      'Absolute path to a file on the machine running this server (a leading "~/" is expanded). Preferred over "content" — the file is streamed from disk rather than passed through the conversation.'
+    ),
+  content: z
+    .string()
+    .optional()
+    .describe('Base64-encoded file content. Use only when the file does not exist on disk; "path" is cheaper.'),
+  contentType: z
+    .string()
+    .optional()
+    .describe('MIME type, e.g. "application/pdf". Inferred from the filename extension when omitted.'),
+  cid: z
+    .string()
+    .optional()
+    .describe(
+      'Content-ID for embedding in htmlBody. When set the part is marked inline and can be referenced as <img src="cid:THE_VALUE">.'
+    ),
+});
 
 const composeShape = {
   to: z.array(z.string()).optional().describe('Recipient email addresses. Optional when replying — defaults to the original sender.'),
   cc: z.array(z.string()).optional(),
   bcc: z.array(z.string()).optional(),
   subject: z.string().optional().describe('Optional when replying — defaults to "Re: <original subject>".'),
-  body: z.string().describe('Plain-text message body.'),
+  body: z
+    .string()
+    .describe(
+      'Plain-text message body. Always required — when htmlBody is also supplied this becomes the plain-text alternative shown by clients that do not render HTML.'
+    ),
+  htmlBody: z
+    .string()
+    .optional()
+    .describe(
+      'Optional HTML message body. When supplied the message is sent as multipart/alternative with both the plain-text and HTML versions. Use for rich signatures, links and basic formatting.'
+    ),
+  attachments: z
+    .array(attachmentShape)
+    .optional()
+    .describe(
+      'Files to attach. Each entry needs exactly one of "path" or "content". Combined size must stay under 25MB — link to Drive for anything larger.'
+    ),
   replyToMessageId: z
     .string()
     .optional()
     .describe('Gmail message ID being replied to. Sets correct threading headers (In-Reply-To/References) and threadId automatically.'),
 };
+
+/** Validates attachment args and maps them to nodemailer's attachment format. */
+function resolveAttachments(args: ComposeArgs) {
+  if (!args.attachments?.length) return undefined;
+
+  let total = 0;
+  const resolved = args.attachments.map((a, i) => {
+    const where = `attachments[${i}]${a.filename ? ` ("${a.filename}")` : ''}`;
+    if (!!a.path === !!a.content) {
+      throw new Error(`${where}: provide exactly one of "path" (a file on this machine) or "content" (base64).`);
+    }
+
+    if (a.path) {
+      const full = a.path.startsWith('~/') ? path.join(os.homedir(), a.path.slice(2)) : path.resolve(a.path);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(full);
+      } catch {
+        throw new Error(`${where}: no file found at ${full}.`);
+      }
+      if (!stat.isFile()) throw new Error(`${where}: ${full} is not a file.`);
+      total += stat.size;
+      return {
+        filename: a.filename ?? path.basename(full),
+        path: full,
+        ...(a.contentType ? { contentType: a.contentType } : {}),
+        ...(a.cid ? { cid: a.cid, contentDisposition: 'inline' as const } : {}),
+      };
+    }
+
+    const buf = Buffer.from(a.content!, 'base64');
+    if (buf.length === 0) throw new Error(`${where}: "content" did not decode to any bytes — is it valid base64?`);
+    total += buf.length;
+    return {
+      filename: a.filename ?? `attachment-${i + 1}`,
+      content: buf,
+      ...(a.contentType ? { contentType: a.contentType } : {}),
+      ...(a.cid ? { cid: a.cid, contentDisposition: 'inline' as const } : {}),
+    };
+  });
+
+  if (total > MAX_ATTACHMENT_BYTES) {
+    throw new Error(
+      `Attachments total ${(total / 1024 / 1024).toFixed(1)}MB, over Gmail's 25MB limit. ` +
+        'Upload the file to Drive and link it in the body instead.'
+    );
+  }
+  return resolved;
+}
 
 async function buildMime(ctx: AccountContext, args: ComposeArgs): Promise<{ raw: string; threadId?: string }> {
   let { to, cc, bcc, subject } = args;
@@ -105,7 +210,19 @@ async function buildMime(ctx: AccountContext, args: ComposeArgs): Promise<{ raw:
   }
   if (!to || to.length === 0) throw new Error('"to" is required unless replyToMessageId is provided.');
 
-  const mail = new MailComposer({ to, cc, bcc, subject, text: args.body, inReplyTo, references });
+  const attachments = resolveAttachments(args);
+
+  const mail = new MailComposer({
+    to,
+    cc,
+    bcc,
+    subject,
+    text: args.body,
+    ...(args.htmlBody ? { html: args.htmlBody } : {}),
+    ...(attachments ? { attachments } : {}),
+    inReplyTo,
+    references,
+  });
   const buf = await new Promise<Buffer>((resolve, reject) =>
     mail.compile().build((err, message) => (err ? reject(err) : resolve(message)))
   );
@@ -269,13 +386,26 @@ export function registerTools(server: McpServer): void {
     server,
     'get_message',
     PREFIX + 'Read a single email message in full (untruncated up to ~20k chars).',
-    { account, messageId: z.string() },
+    {
+      account,
+      messageId: z.string(),
+      includeHtml: z
+        .boolean()
+        .optional()
+        .describe(
+          'Also return the raw text/html part as htmlBody. Off by default because HTML is verbose — turn it on when the markup itself matters, e.g. to copy a signature or inspect a template.'
+        ),
+    },
     async (args) => {
       const ctx = gmailFor(args.account);
       const res = await callGmail(ctx, 'get message', () =>
         ctx.gmail.users.messages.get({ userId: 'me', id: args.messageId, format: 'full' })
       );
-      return { account: ctx.alias, email: ctx.email, ...shapeMessage(res.data, 20000) };
+      return {
+        account: ctx.alias,
+        email: ctx.email,
+        ...shapeMessage(res.data, 20000, args.includeHtml === true),
+      };
     }
   );
 
