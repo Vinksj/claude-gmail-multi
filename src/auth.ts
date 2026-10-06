@@ -9,6 +9,28 @@ import { loadClientCredentials, loadConfig, saveConfig, writeToken, dropClient }
 export const GMAIL_SCOPE = 'https://www.googleapis.com/auth/gmail.modify';
 const AUTH_TIMEOUT_MS = 5 * 60 * 1000;
 
+/**
+ * Best-effort: open the URL in the default browser. The URL is always printed too, so any
+ * failure (no opener on PATH, headless box) is swallowed. spawn reports a missing executable
+ * via an async 'error' event, not a throw, so that event needs a listener or it crashes Node.
+ * On Windows, rundll32 is used instead of `cmd /c start` because cmd would split the URL on '&'.
+ */
+function openBrowser(url: string): void {
+  const [cmd, args]: [string, string[]] =
+    process.platform === 'darwin'
+      ? ['open', [url]]
+      : process.platform === 'win32'
+        ? ['rundll32', ['url.dll,FileProtocolHandler', url]]
+        : ['xdg-open', [url]];
+  try {
+    const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
+    child.on('error', () => {});
+    child.unref();
+  } catch {
+    // the URL was printed
+  }
+}
+
 export interface AuthResult {
   alias: string;
   email: string;
@@ -83,11 +105,7 @@ export async function authorizeAccount(
   });
 
   log(`Authorize ${expectedEmail ?? `account "${alias}"`} in the browser (URL below if it didn't open):\n${authUrl}`);
-  try {
-    spawn('open', [authUrl], { stdio: 'ignore', detached: true }).unref();
-  } catch {
-    // browser open is best-effort; the URL was printed
-  }
+  openBrowser(authUrl);
 
   try {
     const code = await codePromise;
